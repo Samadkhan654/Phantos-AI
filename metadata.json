@@ -1,0 +1,6 @@
+{
+  "name": "Phantos AI",
+  "description": "An interactive telemetry, observability and self-correcting agent dashboard utilizing Arize Phoenix tracers and LLM judge evaluations.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

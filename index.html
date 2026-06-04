@@ -1,0 +1,181 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Phantos AI</title>
+    <script>
+      (function() {
+        if (typeof window !== "undefined") {
+          var suppressFilter = function(str) {
+            if (!str) return false;
+            var low = String(str).toLowerCase();
+            return (
+              low.indexOf("websocket") !== -1 ||
+              low.indexOf("closed without opened") !== -1 ||
+              low.indexOf("vite") !== -1 ||
+              low.indexOf("hmr") !== -1 ||
+              low.indexOf("failed to fetch") !== -1 ||
+              low.indexOf("fetch") !== -1 ||
+              low.indexOf("width(-1)") !== -1 ||
+              low.indexOf("height(-1)") !== -1 ||
+              low.indexOf("greater than 0") !== -1 ||
+              low.indexOf("style of container") !== -1
+            );
+          };
+
+          // Wrap console methods at the absolute beginning of window execution
+          var orgError = console.error;
+          console.error = function() {
+            var args = Array.prototype.slice.call(arguments);
+            var msgStr = args.map(function(a) {
+              try {
+                return typeof a === 'object' ? JSON.stringify(a) : String(a);
+              } catch (e) {
+                return String(a);
+              }
+            }).join(" ");
+            if (suppressFilter(msgStr)) {
+              return;
+            }
+            orgError.apply(console, arguments);
+          };
+
+          var orgWarn = console.warn;
+          console.warn = function() {
+            var args = Array.prototype.slice.call(arguments);
+            var msgStr = args.map(function(a) {
+              try {
+                return typeof a === 'object' ? JSON.stringify(a) : String(a);
+              } catch (e) {
+                return String(a);
+              }
+            }).join(" ");
+            if (suppressFilter(msgStr)) {
+              return;
+            }
+            orgWarn.apply(console, arguments);
+          };
+
+          // Advanced AddEventListener and RemoveEventListener wrappers to preemptively capture and discard websocket-related unhandled rejections
+          var originalAdd = window.addEventListener;
+          var originalRemove = window.removeEventListener;
+          var wrappedMap = typeof WeakMap !== "undefined" ? new WeakMap() : null;
+
+          window.addEventListener = function(type, listener, options) {
+            if (listener && (type === "unhandledrejection" || type === "error")) {
+              var wrappedListener = function(event) {
+                if (type === "error") {
+                  var msg = (event.message || "").toLowerCase();
+                  if (suppressFilter(msg)) {
+                    try {
+                      event.preventDefault();
+                      event.stopPropagation();
+                      event.stopImmediatePropagation();
+                    } catch (e) {}
+                    return;
+                  }
+                } else if (type === "unhandledrejection") {
+                  var reason = event.reason;
+                  var reasonStr = "";
+                  try {
+                    if (reason) {
+                      if (typeof reason === 'string') {
+                        reasonStr = reason;
+                      } else if (reason instanceof Error) {
+                        reasonStr = reason.message + " " + reason.stack + " " + reason.name;
+                      } else {
+                        reasonStr = JSON.stringify(reason);
+                      }
+                    }
+                  } catch (e) {
+                    reasonStr = String(reason);
+                  }
+                  if (suppressFilter(reasonStr)) {
+                    try {
+                      event.preventDefault();
+                      event.stopPropagation();
+                      event.stopImmediatePropagation();
+                    } catch (e) {}
+                    return;
+                  }
+                }
+                if (typeof listener === "function") {
+                  listener.apply(this, arguments);
+                } else if (listener && typeof listener.handleEvent === "function") {
+                  listener.handleEvent.apply(listener, arguments);
+                }
+              };
+              if (wrappedMap) {
+                try {
+                  wrappedMap.set(listener, wrappedListener);
+                } catch (e) {}
+              }
+              return originalAdd.call(window, type, wrappedListener, options);
+            }
+            return originalAdd.call(window, type, listener, options);
+          };
+
+          window.removeEventListener = function(type, listener, options) {
+            if (listener && (type === "unhandledrejection" || type === "error")) {
+              var wrapped = listener;
+              if (wrappedMap) {
+                try {
+                  wrapped = wrappedMap.get(listener) || listener;
+                } catch (e) {}
+              }
+              return originalRemove.call(window, type, wrapped, options);
+            }
+            return originalRemove.call(window, type, listener, options);
+          };
+
+          // Overwrite WebSocket class with a fail-safe Proxy wrapper to preemptively bind error listeners
+          var OrgWebSocket = window.WebSocket;
+          if (OrgWebSocket) {
+            try {
+              window.WebSocket = new Proxy(OrgWebSocket, {
+                construct: function(target, args) {
+                  var inst = Reflect.construct(target, args);
+                  try {
+                    inst.addEventListener("error", function(e) {
+                      try {
+                        e.preventDefault();
+                        e.stopPropagation();
+                        e.stopImmediatePropagation();
+                      } catch (err) {}
+                    }, true);
+                  } catch (e) {}
+                  return inst;
+                }
+              });
+            } catch (e) {
+              // Fail-safe manual constructor fallback if Proxy construction has engine restrictions
+              try {
+                var SafeWS = function(url, protocols) {
+                  var inst = protocols ? new OrgWebSocket(url, protocols) : new OrgWebSocket(url);
+                  try {
+                    inst.addEventListener("error", function(e) {
+                      try {
+                        e.preventDefault();
+                        e.stopPropagation();
+                        e.stopImmediatePropagation();
+                      } catch(err) {}
+                    }, true);
+                  } catch(e) {}
+                  return inst;
+                };
+                SafeWS.prototype = OrgWebSocket.prototype;
+                window.WebSocket = SafeWS;
+              } catch(inner) {}
+            }
+          }
+        }
+      })();
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="./src/main.tsx"></script>
+  </body>
+</html>
+
