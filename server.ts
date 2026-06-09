@@ -20,9 +20,14 @@ if (!process.env.PHOENIX_COLLECTOR_ENDPOINT) {
   process.env.PHOENIX_COLLECTOR_ENDPOINT = 'https://app.phoenix.arize.com/s/samadkhansameerkhan';
 }
 
-const provider = register({
-  projectName: "AgentWatch",
-});
+let provider: any = null;
+try {
+  provider = register({
+    projectName: "AgentWatch",
+  });
+} catch (err) {
+  console.warn("Unable to register Arize Phoenix OpenTelemetry provider:", err);
+}
 
 const app = express();
 app.use(express.json());
@@ -189,6 +194,26 @@ async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, errorMessa
   }
 }
 
+function parseJsonResponse(rawText: string): any {
+  let cleanText = rawText.trim();
+  
+  // Clean up markdown code blocks if present (e.g., ```json or ```)
+  if (cleanText.startsWith("```")) {
+    const firstLineEnd = cleanText.indexOf("\n");
+    if (firstLineEnd !== -1) {
+      cleanText = cleanText.substring(firstLineEnd + 1);
+    } else {
+      cleanText = cleanText.replace(/^```[a-zA-Z]*/, "");
+    }
+  }
+  if (cleanText.endsWith("```")) {
+    cleanText = cleanText.substring(0, cleanText.length - 3);
+  }
+  cleanText = cleanText.trim();
+  
+  return JSON.parse(cleanText);
+}
+
 // Retry helper for robustness against transient 503 high demand or 429 quota spikes
 async function generateContentWithRetry(
   client: GoogleGenAI,
@@ -200,14 +225,18 @@ async function generateContentWithRetry(
   timeoutMs: number = 20000,
   maxRetries: number = 4
 ): Promise<any> {
+  const isVercel = !!process.env.VERCEL;
+  const actualTimeoutMs = isVercel ? Math.min(timeoutMs, 4000) : timeoutMs;
+  const actualMaxRetries = isVercel ? Math.min(maxRetries, 2) : maxRetries;
+  
   let attempt = 0;
   let lastError: any = null;
   const initialModel = params.model;
-  while (attempt < maxRetries) {
+  while (attempt < actualMaxRetries) {
     try {
       return await withTimeout(
         client.models.generateContent(params),
-        timeoutMs,
+        actualTimeoutMs,
         "Gemini API call timed out"
       );
     } catch (e: any) {
@@ -217,7 +246,7 @@ async function generateContentWithRetry(
       const is503 = errorMsg.includes("503") || errorMsg.toLowerCase().includes("unavailable") || errorMsg.toLowerCase().includes("high demand") || e.status === 503 || e.code === 503;
       const is429 = errorMsg.includes("429") || errorMsg.toLowerCase().includes("quota") || errorMsg.toLowerCase().includes("resource_exhausted") || e.status === 429 || e.code === 429;
       
-      if (attempt < maxRetries && (is503 || is429 || errorMsg.includes("timed out") || errorMsg.includes("temporary"))) {
+      if (attempt < actualMaxRetries && (is503 || is429 || errorMsg.includes("timed out") || errorMsg.includes("temporary"))) {
         // Active model rotation to bypass transient 503 High Demand rates or 429 quota spikes on gemini-3.5-flash
         if (initialModel === "gemini-3.5-flash") {
           if (attempt === 1) {
@@ -229,8 +258,11 @@ async function generateContentWithRetry(
           }
         }
         
-        // Increased delay with exponential backoff (starting at ~2000ms) to let Gemini servers recover under high demand
-        const delay = Math.pow(2, attempt) * 1000 + Math.random() * 500;
+        // Sleep delay with tighter intervals on Vercel to preserve execution budget
+        const delay = isVercel 
+          ? (500 + Math.random() * 200) 
+          : (Math.pow(2, attempt) * 1000 + Math.random() * 500);
+          
         // Print clean, non-alarming status update without using parser triggers like failed, error or raw JSON blocks
         console.log(`[Gemini Recovery] Cycle ${attempt} redirected to model ${params.model} (re-attempt after delay).`);
         await new Promise(resolve => setTimeout(resolve, delay));
@@ -371,6 +403,7 @@ Return your feedback in STRICT, parseable JSON only. Do not wrap in markdown \`\
 
   if (client) {
     try {
+      const isVercel = !!process.env.VERCEL;
       const response = await generateContentWithRetry(
         client,
         {
@@ -380,17 +413,18 @@ Return your feedback in STRICT, parseable JSON only. Do not wrap in markdown \`\
             responseMimeType: "application/json"
           }
         },
-        20000
+        isVercel ? 2500 : 10000,
+        isVercel ? 1 : 2
       );
       const rawText = response.text || "";
-      const parsed = JSON.parse(rawText.trim());
+      const parsed = parseJsonResponse(rawText);
       return {
-        accuracy: parsed.accuracy || 0,
-        helpfulness: parsed.helpfulness || 0,
-        completeness: parsed.completeness || 0,
-        honesty: parsed.honesty || 0,
-        overall: parsed.overall || 0,
-        confidence: parsed.confidence || 0.90,
+        accuracy: parsed.accuracy ?? 0,
+        helpfulness: parsed.helpfulness ?? 0,
+        completeness: parsed.completeness ?? 0,
+        honesty: parsed.honesty ?? 0,
+        overall: parsed.overall ?? 0,
+        confidence: parsed.confidence ?? 0.90,
         reasoning: parsed.reasoning || "Evaluation processed.",
         mainProblem: parsed.main_problem,
         suggestion: parsed.improvement
@@ -505,6 +539,7 @@ ${context}`;
 
     if (client) {
       try {
+        const isVercel = !!process.env.VERCEL;
         const response = await generateContentWithRetry(
           client,
           {
@@ -514,7 +549,8 @@ ${context}`;
               systemInstruction: systemPrompt
             }
           },
-          20000
+          isVercel ? 3500 : 12000,
+          isVercel ? 2 : 3
         );
         return response.text || "";
       } catch (e: any) {
@@ -735,7 +771,9 @@ app.post("/api/chat", async (req, res) => {
 
     // Flush pending Phoenix traces before completing the response
     try {
-      await provider.forceFlush();
+      if (provider) {
+        await withTimeout(provider.forceFlush(), 1000, "Phoenix forceFlush timed out");
+      }
     } catch (flushErr) {
       console.warn("Telemetry provider forceFlush error:", flushErr);
     }
@@ -796,6 +834,7 @@ app.post("/api/improve", async (req, res) => {
       }
     ]
   }`;
+        const isVercel = !!process.env.VERCEL;
         const response = await generateContentWithRetry(
           client,
           {
@@ -805,10 +844,11 @@ app.post("/api/improve", async (req, res) => {
               responseMimeType: "application/json"
             }
           },
-          20000
+          isVercel ? 4000 : 15000,
+          isVercel ? 1 : 2
         );
         const rawText = response.text || "";
-        const parsed = JSON.parse(rawText.trim());
+        const parsed = parseJsonResponse(rawText);
         patterns = parsed.failurePatterns || [];
         newRules = (parsed.rules || []).map((r: any) => ({
           text: r.ruleText,
