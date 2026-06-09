@@ -23,7 +23,7 @@ if (!process.env.PHOENIX_COLLECTOR_ENDPOINT) {
 let provider: any = null;
 try {
   provider = register({
-    projectName: "AgentWatch",
+    projectName: "PHANTOS_AI",
   });
 } catch (err) {
   console.warn("Unable to register Arize Phoenix OpenTelemetry provider:", err);
