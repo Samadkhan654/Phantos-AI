@@ -189,6 +189,55 @@ async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, errorMessa
   }
 }
 
+// Retry helper for robustness against transient 503 high demand or 429 quota spikes
+async function generateContentWithRetry(
+  client: GoogleGenAI,
+  params: {
+    model: string;
+    contents: any;
+    config?: any;
+  },
+  timeoutMs: number = 20000,
+  maxRetries: number = 4
+): Promise<any> {
+  let attempt = 0;
+  let lastError: any = null;
+  while (attempt < maxRetries) {
+    try {
+      return await withTimeout(
+        client.models.generateContent(params),
+        timeoutMs,
+        "Gemini API call timed out"
+      );
+    } catch (e: any) {
+      attempt++;
+      lastError = e;
+      const errorMsg = e.message || String(e);
+      const is503 = errorMsg.includes("503") || errorMsg.toLowerCase().includes("unavailable") || errorMsg.toLowerCase().includes("high demand") || e.status === 503 || e.code === 503;
+      const is429 = errorMsg.includes("429") || errorMsg.toLowerCase().includes("quota") || errorMsg.toLowerCase().includes("resource_exhausted") || e.status === 429 || e.code === 429;
+      
+      if (attempt < maxRetries && (is503 || is429 || errorMsg.includes("timed out") || errorMsg.includes("temporary"))) {
+        // Active model rotation to bypass transient 503 High Demand rates or 429 quota spikes on gemini-3.5-flash
+        if (params.model === "gemini-3.5-flash") {
+          if (attempt === 1) {
+            params.model = "gemini-flash-latest";
+          } else if (attempt === 2) {
+            params.model = "gemini-3.1-flash-lite";
+          }
+        }
+        
+        // Increased delay with exponential backoff (starting at ~2000ms) to let Gemini servers recover under high demand
+        const delay = Math.pow(2, attempt) * 1000 + Math.random() * 500;
+        console.warn(`[Gemini Retry] Attempt ${attempt} failed with error: "${errorMsg}". Retrying with model ${params.model} in ${Math.round(delay)}ms...`);
+        await new Promise(resolve => setTimeout(resolve, delay));
+      } else {
+        break;
+      }
+    }
+  }
+  throw lastError;
+}
+
 // API clients lazy initializer
 let aiClient: GoogleGenAI | null = null;
 let isGeminiQuotaExceeded = false;
@@ -318,16 +367,16 @@ Return your feedback in STRICT, parseable JSON only. Do not wrap in markdown \`\
 
   if (client) {
     try {
-      const response = await withTimeout(
-        client.models.generateContent({
+      const response = await generateContentWithRetry(
+        client,
+        {
           model: "gemini-3.5-flash",
           contents: prompt,
           config: {
             responseMimeType: "application/json"
           }
-        }),
-        7000,
-        "Gemini judge evaluation call timed out"
+        },
+        20000
       );
       const rawText = response.text || "";
       const parsed = JSON.parse(rawText.trim());
@@ -452,16 +501,16 @@ ${context}`;
 
     if (client) {
       try {
-        const response = await withTimeout(
-          client.models.generateContent({
+        const response = await generateContentWithRetry(
+          client,
+          {
             model: "gemini-3.5-flash",
             contents: question,
             config: {
               systemInstruction: systemPrompt
             }
-          }),
-          7000,
-          "Gemini agent assistant call timed out"
+          },
+          20000
         );
         return response.text || "";
       } catch (e: any) {
@@ -735,16 +784,16 @@ app.post("/api/improve", async (req, res) => {
       }
     ]
   }`;
-        const response = await withTimeout(
-          client.models.generateContent({
+        const response = await generateContentWithRetry(
+          client,
+          {
             model: "gemini-3.5-flash",
             contents: learnPrompt,
             config: {
               responseMimeType: "application/json"
             }
-          }),
-          7000,
-          "Gemini learning loop call timed out"
+          },
+          20000
         );
         const rawText = response.text || "";
         const parsed = JSON.parse(rawText.trim());
