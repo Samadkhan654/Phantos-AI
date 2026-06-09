@@ -131,22 +131,117 @@ export default function App() {
     geminiOnline: false
   });
 
-  // State caches
-  const [traces, setTraces] = useState<Trace[]>([]);
+  // Helper to statelessly compute metrics locally for robust offline / Serverless Vercel support
+  const computeMetrics = (currentTraces: Trace[], currentHistory: ImprovementEvent[]): SessionMetrics => {
+    const total = currentTraces.length;
+    if (total === 0) {
+      return {
+        averageScore: 0.0,
+        totalConversations: 0,
+        selfCorrectionsCount: 0,
+        highestScore: 0.0,
+        lowestScore: 0.0,
+        improvementPercent: 0,
+        scoreHistory: [],
+        dimensionAverages: { accuracy: 0, helpfulness: 0, completeness: 0, honesty: 0 }
+      };
+    }
+
+    const scores = currentTraces.map(t => t.evaluation?.overall || 0);
+    const averageScore = Math.round((scores.reduce((a, b) => a + b, 0) / total) * 100) / 100;
+    const highestScore = Math.max(...scores);
+    const lowestScore = Math.min(...scores);
+    
+    const corrections = currentTraces.filter(t => t.wasSelfCorrected).length;
+
+    // Build sequential score history grouped by turn index
+    const scoreHistory = currentTraces.map((t, idx) => {
+      // Check if an improvement cycle happened immediately before or near this timestamp
+      const hasImprovementNode = currentHistory.some(e => 
+        Math.abs(new Date(e.timestamp).getTime() - new Date(t.timestamp).getTime()) < 10000
+      );
+      return {
+        turn: idx + 1,
+        score: t.evaluation?.overall || 0,
+        isImprovementNode: t.wasSelfCorrected || hasImprovementNode
+      };
+    });
+
+    // Calculate breakdown dimensions
+    const accuracy = Math.round((currentTraces.reduce((s, t) => s + (t.evaluation?.accuracy || 0), 0) / total) * 100) / 100;
+    const helpfulness = Math.round((currentTraces.reduce((s, t) => s + (t.evaluation?.helpfulness || 0), 0) / total) * 100) / 100;
+    const completeness = Math.round((currentTraces.reduce((s, t) => s + (t.evaluation?.completeness || 0), 0) / total) * 100) / 100;
+    const honesty = Math.round((currentTraces.reduce((s, t) => s + (t.evaluation?.honesty || 0), 0) / total) * 100) / 100;
+
+    // Improvement ratio
+    const scoreBeforeImprove = scores.filter((_, i) => i < 2).reduce((a, b) => a + b, 0) / Math.max(1, scores.filter((_, i) => i < 2).length);
+    const scoreAfterImprove = scores.filter((_, i) => i >= 4).reduce((a, b) => a + b, 0) / Math.max(1, scores.filter((_, i) => i >= 4).length);
+    let totalImproveFactor = 0;
+    if (scoreBeforeImprove > 0 && scoreAfterImprove > 0) {
+      totalImproveFactor = Math.round(((scoreAfterImprove - scoreBeforeImprove) / scoreBeforeImprove) * 100);
+    }
+
+    return {
+      averageScore,
+      totalConversations: total,
+      selfCorrectionsCount: corrections,
+      highestScore,
+      lowestScore,
+      improvementPercent: Math.max(0, totalImproveFactor || Math.round((averageScore - 0.5) * 100)),
+      scoreHistory,
+      dimensionAverages: { accuracy, helpfulness, completeness, honesty }
+    };
+  };
+
+  // State caches (hydrated from regional localStorage persistence to protect against cold container recycles)
+  const [traces, setTraces] = useState<Trace[]>(() => {
+    try {
+      const saved = localStorage.getItem("agentwatch_traces");
+      return saved ? JSON.parse(saved) : [];
+    } catch (_) {
+      return [];
+    }
+  });
   const [selectedTrace, setSelectedTrace] = useState<Trace | null>(null);
   const [selectedSpan, setSelectedSpan] = useState<TraceSpan | null>(null);
-  const [metrics, setMetrics] = useState<SessionMetrics>({
-    averageScore: 0,
-    totalConversations: 0,
-    selfCorrectionsCount: 0,
-    highestScore: 0,
-    lowestScore: 0,
-    improvementPercent: 0,
-    scoreHistory: [],
-    dimensionAverages: { accuracy: 0, helpfulness: 0, completeness: 0, honesty: 0 }
+  
+  const [activeRules, setActiveRules] = useState<Rule[]>(() => {
+    try {
+      const saved = localStorage.getItem("agentwatch_rules");
+      return saved ? JSON.parse(saved) : [
+        {
+          id: "rule-init-1",
+          text: "Maintain a helpful, direct, and professional tone when answering electronics inquiries.",
+          category: "general_behavior",
+          addedAt: new Date().toISOString(),
+          reason: "Seeding default customer support parameters."
+        }
+      ];
+    } catch (_) {
+      return [
+        {
+          id: "rule-init-1",
+          text: "Maintain a helpful, direct, and professional tone when answering electronics inquiries.",
+          category: "general_behavior",
+          addedAt: new Date().toISOString(),
+          reason: "Seeding default customer support parameters."
+        }
+      ];
+    }
   });
-  const [activeRules, setActiveRules] = useState<Rule[]>([]);
-  const [improvementHistory, setImprovementHistory] = useState<ImprovementEvent[]>([]);
+
+  const [improvementHistory, setImprovementHistory] = useState<ImprovementEvent[]>(() => {
+    try {
+      const saved = localStorage.getItem("agentwatch_improvement_history");
+      return saved ? JSON.parse(saved) : [];
+    } catch (_) {
+      return [];
+    }
+  });
+
+  const [metrics, setMetrics] = useState<SessionMetrics>(() => {
+    return computeMetrics(traces, improvementHistory);
+  });
   
   // Super Features States
   // 1. Persistence & Welcome Banner
@@ -548,31 +643,38 @@ export default function App() {
       const hData = await safeFetch("/api/health", "Health Status", { status: "offline", geminiOnline: false });
       setHealthStatus(hData);
 
-      const mData = await safeFetch(`/api/metrics/${sessionId}`, "Telemetry Metrics", {
-        averageScore: 0.0,
-        totalConversations: 0,
-        selfCorrectionsCount: 0,
-        highestScore: 0.0,
-        lowestScore: 0.0,
-        improvementPercent: 0,
-        scoreHistory: [],
-        dimensionAverages: { accuracy: 0, helpfulness: 0, completeness: 0, honesty: 0 }
-      });
-      setMetrics(mData);
+      const mData = await safeFetch(`/api/metrics/${sessionId}`, "Telemetry Metrics", null);
+      const tData = await safeFetch(`/api/traces/${sessionId}`, "Telemetry Traces", null);
+      const rData = await safeFetch("/api/rules", "Custom Telemetry Rules", null);
+      const hiData = await safeFetch(`/api/history/${sessionId}`, "Telemetry History", null);
 
-      const tData = await safeFetch(`/api/traces/${sessionId}`, "Telemetry Traces", []);
-      setTraces(tData);
+      // Use server arrays if they exist and are non-empty, otherwise use/protect client caches.
+      // In stateless/serverless environments this keeps state perfectly intact!
+      const finalTraces = (tData && tData.length > 0) ? tData : traces;
+      setTraces(finalTraces);
+      if (tData && tData.length > 0) {
+        localStorage.setItem("agentwatch_traces", JSON.stringify(finalTraces));
+      }
 
-      const rData = await safeFetch("/api/rules", "Custom Telemetry Rules", []);
-      setActiveRules(rData);
+      const finalRules = (rData && rData.length > 0) ? rData : activeRules;
+      setActiveRules(finalRules);
+      if (rData && rData.length > 0) {
+        localStorage.setItem("agentwatch_rules", JSON.stringify(finalRules));
+      }
 
-      const hiData = await safeFetch(`/api/history/${sessionId}`, "Telemetry History", []);
-      setImprovementHistory(hiData);
+      const finalHistory = (hiData && hiData.length > 0) ? hiData : improvementHistory;
+      setImprovementHistory(finalHistory);
+      if (hiData && hiData.length > 0) {
+        localStorage.setItem("agentwatch_improvement_history", JSON.stringify(finalHistory));
+      }
 
-      return tData;
+      const finalMetrics = (mData && mData.totalConversations > 0) ? mData : computeMetrics(finalTraces, finalHistory);
+      setMetrics(finalMetrics);
+
+      return finalTraces;
     } catch (e) {
       console.warn("Failed to load metrics or spans from console host:", e);
-      return [];
+      return traces;
     }
   };
 
@@ -774,7 +876,7 @@ export default function App() {
       const response = await fetch("/api/chat", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ question: rawTxt, sessionId })
+        body: JSON.stringify({ question: rawTxt, sessionId, customRules: activeRules })
       });
 
       if (!response.ok) {
@@ -788,7 +890,18 @@ export default function App() {
         throw new Error(errMessage);
       }
 
-      const assistantMsg: ChatMessage = await response.json();
+      const assistantMsg: ChatMessage & { trace?: Trace } = await response.json();
+
+      // Hydrate local cache and recalculate metrics immediately (serverless resilience)
+      let localFreshTraces = traces;
+      if (assistantMsg.trace) {
+        localFreshTraces = [...traces, assistantMsg.trace];
+        setTraces(localFreshTraces);
+        localStorage.setItem("agentwatch_traces", JSON.stringify(localFreshTraces));
+        
+        const updatedMetrics = computeMetrics(localFreshTraces, improvementHistory);
+        setMetrics(updatedMetrics);
+      }
 
       // Check for policy gaps and simulated hallucinations
       const lowercaseQ = rawTxt.toLowerCase();
@@ -869,7 +982,7 @@ export default function App() {
       const freshTraces = await fetchData();
       
       // Auto highlight OTel trace
-      await selectTraceByMsg(assistantMsg.traceId, freshTraces);
+      await selectTraceByMsg(assistantMsg.traceId, (freshTraces && freshTraces.length > 0) ? freshTraces : localFreshTraces);
     } catch (e: any) {
       console.error("Retail chat pipeline failed:", e);
       setMessages(prev => [...prev, {
@@ -947,6 +1060,31 @@ export default function App() {
       setHallucinationHistory([]);
       setLearningSessions(1);
       setWelcomeBannerOpen(false);
+
+      localStorage.removeItem("agentwatch_traces");
+      localStorage.removeItem("agentwatch_rules");
+      localStorage.removeItem("agentwatch_improvement_history");
+      setTraces([]);
+      setActiveRules([
+        {
+          id: "rule-init-1",
+          text: "Maintain a helpful, direct, and professional tone when answering electronics inquiries.",
+          category: "general_behavior",
+          addedAt: new Date().toISOString(),
+          reason: "Seeding default customer support parameters."
+        }
+      ]);
+      setImprovementHistory([]);
+      setMetrics({
+        averageScore: 0,
+        totalConversations: 0,
+        selfCorrectionsCount: 0,
+        highestScore: 0,
+        lowestScore: 0,
+        improvementPercent: 0,
+        scoreHistory: [],
+        dimensionAverages: { accuracy: 0, helpfulness: 0, completeness: 0, honesty: 0 }
+      });
 
       setMessages([]);
       setSelectedTrace(null);
@@ -1184,15 +1322,39 @@ export default function App() {
       const res = await fetch("/api/improve", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ sessionId })
+        body: JSON.stringify({ sessionId, traces, customRules: activeRules })
       });
       const result = await res.json();
-      await fetchData();
       
       // Navigate to rules tab so they confirm rule insertion
       if (result.success) {
+        // Sync rules locally
+        const newRules = result.rulesAdded || [];
+        const updatedRules = [...activeRules];
+        newRules.forEach((nr: any) => {
+          if (!updatedRules.some((r: any) => r.text.toLowerCase() === nr.text.toLowerCase())) {
+            updatedRules.push(nr);
+          }
+        });
+        setActiveRules(updatedRules);
+        localStorage.setItem("agentwatch_rules", JSON.stringify(updatedRules));
+
+        // Sync history locally
+        let updatedHistory = improvementHistory;
+        if (result.event) {
+          updatedHistory = [result.event, ...improvementHistory];
+          setImprovementHistory(updatedHistory);
+          localStorage.setItem("agentwatch_improvement_history", JSON.stringify(updatedHistory));
+        }
+
+        // Compute metrics
+        const updatedMetrics = computeMetrics(traces, updatedHistory);
+        setMetrics(updatedMetrics);
+
         setActiveTab("rules");
       }
+
+      await fetchData();
     } catch (e) {
       console.error("Self-correction loop error:", e);
     } finally {
@@ -1202,7 +1364,7 @@ export default function App() {
     }
   };
 
-  // Clears all logs
+  // Clears all logs (purging cloud + client localStorage buckets safely)
   const resetConsole = async () => {
     if (confirm("Are you sure you want to restore the Agent to day 1 factory uncalibrated state? This will clear all learned safety rules and reset stats!")) {
       localStorage.removeItem("agentwatch_sessions_count");
@@ -1212,6 +1374,31 @@ export default function App() {
       setHallucinationHistory([]);
       setLearningSessions(1);
       setWelcomeBannerOpen(false);
+
+      localStorage.removeItem("agentwatch_traces");
+      localStorage.removeItem("agentwatch_rules");
+      localStorage.removeItem("agentwatch_improvement_history");
+      setTraces([]);
+      setActiveRules([
+        {
+          id: "rule-init-1",
+          text: "Maintain a helpful, direct, and professional tone when answering electronics inquiries.",
+          category: "general_behavior",
+          addedAt: new Date().toISOString(),
+          reason: "Seeding default customer support parameters."
+        }
+      ]);
+      setImprovementHistory([]);
+      setMetrics({
+        averageScore: 0,
+        totalConversations: 0,
+        selfCorrectionsCount: 0,
+        highestScore: 0,
+        lowestScore: 0,
+        improvementPercent: 0,
+        scoreHistory: [],
+        dimensionAverages: { accuracy: 0, helpfulness: 0, completeness: 0, honesty: 0 }
+      });
 
       setMessages([]);
       setSelectedTrace(null);

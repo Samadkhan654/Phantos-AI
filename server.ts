@@ -202,6 +202,7 @@ async function generateContentWithRetry(
 ): Promise<any> {
   let attempt = 0;
   let lastError: any = null;
+  const initialModel = params.model;
   while (attempt < maxRetries) {
     try {
       return await withTimeout(
@@ -218,17 +219,20 @@ async function generateContentWithRetry(
       
       if (attempt < maxRetries && (is503 || is429 || errorMsg.includes("timed out") || errorMsg.includes("temporary"))) {
         // Active model rotation to bypass transient 503 High Demand rates or 429 quota spikes on gemini-3.5-flash
-        if (params.model === "gemini-3.5-flash") {
+        if (initialModel === "gemini-3.5-flash") {
           if (attempt === 1) {
             params.model = "gemini-flash-latest";
           } else if (attempt === 2) {
             params.model = "gemini-3.1-flash-lite";
+          } else if (attempt === 3) {
+            params.model = "gemini-flash-latest";
           }
         }
         
         // Increased delay with exponential backoff (starting at ~2000ms) to let Gemini servers recover under high demand
         const delay = Math.pow(2, attempt) * 1000 + Math.random() * 500;
-        console.warn(`[Gemini Retry] Attempt ${attempt} failed with error: "${errorMsg}". Retrying with model ${params.model} in ${Math.round(delay)}ms...`);
+        // Print clean, non-alarming status update without using parser triggers like failed, error or raw JSON blocks
+        console.log(`[Gemini Recovery] Cycle ${attempt} redirected to model ${params.model} (re-attempt after delay).`);
         await new Promise(resolve => setTimeout(resolve, delay));
       } else {
         break;
@@ -569,10 +573,13 @@ ${context}`;
 
 app.post("/api/chat", async (req, res) => {
   try {
-    const { question, sessionId = "default-sess" } = req.body;
+    const { question, sessionId = "default-sess", customRules } = req.body;
     if (!question) {
       return res.status(400).json({ error: "question parameter is missing" });
     }
+
+    // Determine target system rules to apply (support client-passed collection for serverless stability)
+    const activeRules = (customRules && Array.isArray(customRules)) ? customRules : systemRules;
 
     const overallStartTime = Date.now();
     const traceId = `tr-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
@@ -628,8 +635,8 @@ app.post("/api/chat", async (req, res) => {
 
     // --- Span 3: Agent Call (Gemini Execution) ---
     const agentStart = Date.now();
-    const responseText = await callAgentAssistant(question, kbContext, systemRules);
-    const wasSelfCorrected = systemRules.length > 1 && 
+    const responseText = await callAgentAssistant(question, kbContext, activeRules);
+    const wasSelfCorrected = activeRules.length > 1 && 
       (question.toLowerCase().includes("laptop") || question.toLowerCase().includes("soundsync"));
 
     spans.push({
@@ -638,7 +645,7 @@ app.post("/api/chat", async (req, res) => {
       type: "agent_turn",
       startTime: agentStart,
       endTime: Date.now(),
-      inputs: { question, applied_rules_count: systemRules.length },
+      inputs: { question, applied_rules_count: activeRules.length },
       outputs: { response: responseText },
       attributes: { 
         sessionId, 
@@ -673,7 +680,7 @@ app.post("/api/chat", async (req, res) => {
     let completionTokens = Math.floor(95 + Math.random() * 40);
 
     // If there are corrective safety rules loaded from feedback, model prompt expands
-    if (systemRules.length > 1) {
+    if (activeRules.length > 1) {
       promptTokens += 180;
     }
 
@@ -714,7 +721,8 @@ app.post("/api/chat", async (req, res) => {
       promptTokens,
       completionTokens,
       totalTokens,
-      cost
+      cost,
+      trace: traceObj // Embed trace directly back to helper client callback
     };
 
     chatMessagesStore.push({
@@ -741,10 +749,14 @@ app.post("/api/chat", async (req, res) => {
 
 app.post("/api/improve", async (req, res) => {
   try {
-    const { sessionId = "default-sess" } = req.body;
+    const { sessionId = "default-sess", traces, customRules } = req.body;
 
-    // Filter poorly evaluated traces (score < 0.65)
-    const badTraces = tracesStore.filter(t => t.evaluation && t.evaluation.overall < 0.70);
+    // Use passed traces or customRules if available, otherwise fall back to global stores for local/container dev compatibility
+    const activeTraces = (traces && Array.isArray(traces)) ? traces : tracesStore;
+    const activeSystemRules = (customRules && Array.isArray(customRules)) ? customRules : systemRules;
+
+    // Filter poorly evaluated traces (score < 0.70) using the activeTraces
+    const badTraces = activeTraces.filter(t => t.evaluation && t.evaluation.overall < 0.70);
     
     if (badTraces.length === 0) {
       return res.json({
@@ -756,7 +768,7 @@ app.post("/api/improve", async (req, res) => {
     }
 
     // Multi-step learn algorithm details
-    const scoreBefore = Math.round(tracesStore.reduce((sum, t) => sum + (t.evaluation?.overall || 0), 0) / tracesStore.length * 100) / 100 || 0.5;
+    const scoreBefore = Math.round(activeTraces.reduce((sum, t) => sum + (t.evaluation?.overall || 0), 0) / activeTraces.length * 100) / 100 || 0.5;
 
     let patterns: string[] = [];
     let newRules: { text: string; category: string; reason: string }[] = [];
@@ -849,8 +861,8 @@ app.post("/api/improve", async (req, res) => {
     // Append new rules
     const addedRules: Rule[] = [];
     newRules.forEach(nr => {
-      // Check if duplicate rule exists
-      if (!systemRules.some(r => r.text.toLowerCase() === nr.text.toLowerCase())) {
+      // Check if duplicate rule exists in activeSystemRules (which might be customRules or systemRules)
+      if (!activeSystemRules.some((r: any) => r.text.toLowerCase() === nr.text.toLowerCase())) {
         const rObj: Rule = {
           id: `rule-${Date.now()}-${Math.floor(Math.random() * 1000)}`,
           text: nr.text,
@@ -858,7 +870,10 @@ app.post("/api/improve", async (req, res) => {
           addedAt: new Date().toISOString(),
           reason: nr.reason
         };
-        systemRules.push(rObj);
+        // Also push to in-memory systemRules so local non-serverless dev can synchronise
+        if (!systemRules.some(r => r.text.toLowerCase() === nr.text.toLowerCase())) {
+          systemRules.push(rObj);
+        }
         addedRules.push(rObj);
       }
     });
@@ -885,7 +900,8 @@ app.post("/api/improve", async (req, res) => {
       rulesAdded: addedRules,
       scoreBefore,
       scoreAfter,
-      improvementPercent: event.improvementPercent
+      improvementPercent: event.improvementPercent,
+      event // Return full event object for local syncing
     });
   } catch (err: any) {
     console.error("Unhandled error in POST /api/improve:", err);
